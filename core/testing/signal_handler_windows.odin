@@ -15,7 +15,6 @@ import "base:runtime"
 import "base:intrinsics"
 
 import "core:os"
-import "core:sync"
 import "core:c/libc"
 import "core:strconv"
 import "core:terminal/ansi"
@@ -25,7 +24,14 @@ import win32 "core:sys/windows"
 
 @(private="file") stop_runner_flag: int
 
-@(private="file") stop_test_gate:   sync.Mutex
+// stop_test_gate is 1 from the moment a test thread begins to report a stop
+// until the runner has read the report in _should_stop_test. The reporting
+// thread takes it and the runner releases it, so it is an atomic flag: a
+// sync.Mutex is an SRW lock here, which belongs to the thread that took it.
+// A second test that stops meanwhile waits for the gate rather than
+// overwriting the first report, which would leave the runner waiting forever
+// on a test it was never told had stopped.
+@(private="file") stop_test_gate:   int
 @(private="file") stop_test_index:  int
 @(private="file") stop_test_signal: win32.DWORD
 @(private="file") stop_test_passed: bool
@@ -117,7 +123,10 @@ This is a dire bug and should be reported to the Odin developers.
 		win32.TerminateProcess(win32.GetCurrentProcess(), 1)
 	}
 
-	if sync.mutex_guard(&stop_test_gate) {
+	for intrinsics.atomic_exchange(&stop_test_gate, 1) == 1 {
+		win32.Sleep(1)
+	}
+	{
 		intrinsics.atomic_store(&stop_test_index, local_test_index)
 		intrinsics.atomic_store(&stop_test_signal, code)
 		passed: bool
@@ -151,12 +160,14 @@ This is a dire bug and should be reported to the Odin developers.
 		}
 		intrinsics.atomic_store(&stop_test_passed, passed)
 		intrinsics.atomic_store(&stop_test_alert, 1)
-
 	}
 
-	// Pass on the exeption to the next handler. As we don't wont to recover from it.
-	// This also allows debuggers handle it properly.
-	return win32.EXCEPTION_CONTINUE_SEARCH
+	// Idle until the runner terminates this thread, as the POSIX handler
+	// does. Returning would let a second failure on this thread report
+	// again before the runner has read the first.
+	for {
+		win32.Sleep(1)
+	}
 }
 
 _setup_signal_handler :: proc() {
@@ -187,7 +198,7 @@ _should_stop_runner :: proc() -> bool {
 @(private="file")
 unlock_stop_test_gate :: proc(_: int, _: Stop_Reason, ok: bool) {
 	if ok {
-		sync.mutex_unlock(&stop_test_gate)
+		intrinsics.atomic_store(&stop_test_gate, 0)
 	}
 }
 
